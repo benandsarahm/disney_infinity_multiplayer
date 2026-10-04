@@ -64,20 +64,15 @@ static void* g_pending_item = 0; // item a aplicar (lo consume el hook e01890)
 static int   g_cycle_pending = 0;// 1 = re-materializar el cuerpo de P2 con el nuevo personaje
 static int mem_ok(void* p, SIZE_T n, int write);   // (definida mas abajo)
 
-// ---- lista para el CAMBIADOR de personaje de P2 (Star Wars primero) ----
-typedef struct { const char* name; DWORD sku; } chardef_t;
-static const chardef_t g_chars[] = {
-    {"Ahsoka",0xf430b},{"Anakin",0xf4308},{"ObiWan",0xf4309},{"Yoda",0xf430a},{"DarthMaul",0xf430c},
-    {"Luke",0xf430e},{"HanSolo",0xf430f},{"Leia",0xf4310},{"Chewbacca",0xf4311},{"Vader",0xf4312},{"BobaFett",0xf4313},
-    {"Ezra",0xf4314},{"Kanan",0xf4315},{"Sabine",0xf4316},{"Zeb",0xf4317},
-    {"CaptainAmerica",0xf42a4},{"Hulk",0xf42a5},{"Ironman",0xf42a6},{"Spiderman",0xf42ab},{"Thor",0xf42a7},
-    {"BlackPanther",0xf4336},{"Groot",0xf42a8},{"Rocket",0xf42a9},{"Venom",0xf42b3},
-    {"ClassicMickey",0xf431d},{"Elsa",0xf4259},{"Aladdin",0xf42b5},{"Stitch",0xf42b6},{"Maleficent",0xf42b9},
-    {"JackSparrow",0xf4243},{"Woody",0xf4250},{"Buzz",0xf4248},{"Mulan",0xf431f},
-};
-#define NCHARS (int)(sizeof(g_chars)/sizeof(g_chars[0]))
-static void* g_items_cache[NCHARS] = {0};   // puntero de item por personaje (resuelto una vez)
-static int   g_cyc_idx = 0;
+// ---- lista DINAMICA de personajes (auto-descubierta en memoria al unirse) ----
+// Se escanea el proceso buscando items de catalogo (sku@+0xC8, nombre@+0xD0) en
+// el rango de personajes. Asi cubre CUALQUIER mundo/personaje sin lista a mano.
+#define MAXCHARS 190
+static DWORD g_sku[MAXCHARS];        // sku de cada personaje
+static void* g_item[MAXCHARS];       // puntero al item de catalogo
+static char  g_name[MAXCHARS][24];   // nombre (del juego) para logs
+static int   g_ncyc = 0;             // nº de personajes descubiertos
+static int   g_cyc_idx = 0;          // indice actual del ciclador
 
 // resuelve sku -> puntero del item de catalogo (escaneo; correr en hilo worker)
 static void* resolve_item_ptr(DWORD sku){
@@ -108,8 +103,9 @@ static void* resolve_item_ptr(DWORD sku){
     return 0;
 }
 
-// resuelve TODOS los items de g_chars[] en una sola pasada (para el cambiador)
-static void prescan_items(void){
+// Descubre TODOS los personajes cargados (una pasada por memoria, dedup por sku).
+static void scan_characters(void){
+    g_ncyc = 0;
     MEMORY_BASIC_INFORMATION mbi;
     BYTE* p = 0;
     while(VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)){
@@ -124,16 +120,25 @@ static void prescan_items(void){
                     DWORD nameptr = *(DWORD*)(it + 0xD0);
                     if(nameptr > 0x10000 && mem_ok((void*)nameptr, 1, 0) &&
                        (*(BYTE*)nameptr) >= 0x20 && (*(BYTE*)nameptr) < 0x7f){
-                        for(int i=0;i<NCHARS;i++)
-                            if(!g_items_cache[i] && g_chars[i].sku==sku){ g_items_cache[i]=it; break; }
+                        int dup = 0;
+                        for(int i=0;i<g_ncyc;i++) if(g_sku[i]==sku){ dup=1; break; }
+                        if(!dup && g_ncyc < MAXCHARS){
+                            g_sku[g_ncyc]  = sku;
+                            g_item[g_ncyc] = it;
+                            // copiar el nombre SOLO si hay 24 bytes legibles (evita leer de mas)
+                            if(mem_ok((void*)nameptr, 24, 0))
+                                lstrcpynA(g_name[g_ncyc], (const char*)nameptr, sizeof(g_name[0]));
+                            else
+                                g_name[g_ncyc][0] = 0;
+                            g_ncyc++;
+                        }
                     }
                 }
             }
         }
         p = region + sz;
     }
-    int found=0; for(int i=0;i<NCHARS;i++) if(g_items_cache[i]) found++;
-    L("[coop] cambiador: %d/%d personajes resueltos", found, NCHARS);
+    L("[coop] %d personajes descubiertos", g_ncyc);
 }
 
 #define P2_SKU_DEFAULT 0xf431d   // Mickey (por defecto)
@@ -162,12 +167,13 @@ static void read_p2_sku(void){
 void* g_tramp_e01890 = 0;
 void* g_tramp_solidify = 0;
 
-static void* install_hook(void* target, void* detour, int copylen){
+static void* install_hook(void* target, void* detour, int copylen, void** slot){
     BYTE* tramp = (BYTE*)VirtualAlloc(0, copylen + 5, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if(!tramp) return 0;
     memcpy(tramp, target, copylen);
     tramp[copylen] = 0xE9;
     *(DWORD*)(tramp + copylen + 1) = (DWORD)((BYTE*)target + copylen) - (DWORD)(tramp + copylen + 5);
+    if(slot) *slot = tramp;   // publicar el trampolin ANTES de parchear (evita carrera)
     DWORD old;
     VirtualProtect(target, copylen, PAGE_EXECUTE_READWRITE, &old);
     ((BYTE*)target)[0] = 0xE9;
@@ -177,6 +183,181 @@ static void* install_hook(void* target, void* detour, int copylen){
     FlushInstructionCache(GetCurrentProcess(), target, copylen);
     return tramp;
 }
+
+// ===================== PUENTE CON LA VM DE LUA 5.1 =====================
+// RVAs de la API de Lua medidos por CrabeLoader/Lucas (game_profile.cpp,
+// perfil di3-gold-steam-1.0) y verificados contra nuestro Ghidra. Son RVA
+// (offset desde base), igual que el resto de direcciones de codigo del mod.
+// DISENO: lua_pcall es el punto CORRECTO (se llama sin parar en gameplay, en el
+// estado bueno, top-level). Pero la materializacion es delicada e
+// intermitentemente inestable por si sola, asi que el hook de pcall se instala
+// PEREZOSAMENTE (al 1er L3+R3, ya materializado) para no estar activo durante
+// ella. loadbuffer se llama DIRECTO (sin hook) para compilar el chunk.
+typedef int  (__cdecl *lua_pcall_t)(void* L, int nargs, int nres, int errfunc);
+typedef int  (__cdecl *luaL_loadbuffer_t)(void* L, const char* buff, size_t sz, const char* name);
+typedef const char* (__cdecl *lua_tolstring_t)(void* L, int idx, size_t* len);
+typedef int  (__cdecl *lua_gettop_t)(void* L);
+typedef void (__cdecl *lua_settop_t)(void* L, int idx);
+
+#define RVA_LUAL_LOADBUFFER 0xF0EDE0
+#define RVA_LUA_PCALL       0xF0DF60
+#define RVA_LUA_TOLSTRING   0xF0D5A0
+#define RVA_LUA_GETTOP      0xF0D0E0
+#define RVA_LUA_SETTOP      0xF0D0F0
+
+static luaL_loadbuffer_t p_loadbuffer = 0;   // directo (loadbuffer real, sin hook)
+static lua_tolstring_t   p_tolstring  = 0;
+static lua_gettop_t      p_gettop     = 0;
+static lua_settop_t      p_settop     = 0;
+void* g_tramp_pcall = 0;                      // trampolin del hook de pcall (pcall real)
+
+static void* volatile g_L = 0;           // lua_State de gameplay (capturado en pcall)
+static volatile int g_lua_pending = 0;   // 1 = ejecutar g_lua_chunk (trigger L3+R3 de prueba)
+static char g_lua_chunk[8192];           // chunk del trigger de prueba (fichero)
+static char g_sys_chunk[2560];           // chunks internos del mod (setup / ciclo)
+static char g_lua_ret[64];               // ultimo valor devuelto por un chunk (string)
+static int  g_in_tick = 0;               // guard anti-reentrada (mismo hilo)
+static int  g_pcall_hooked = 0;
+static int  g_setup_done = 0;            // COOP_NEXT/COOP_FIX definidos + inicial validado
+static volatile int g_cycle_req = 0;     // 1 = procesar cambio de ciclo (RB/LB)
+static volatile int g_cycle_dir = 1;     // +1 siguiente, -1 anterior
+
+// Ejecuta un chunk Lua en el estado LS. loadbuffer DIRECTO + trampolin de pcall.
+// Guarda el valor devuelto (como string) en g_lua_ret.
+static void run_lua_chunk(void* LS, const char* chunk){
+    g_lua_ret[0] = 0;
+    if(!p_loadbuffer || !g_tramp_pcall || !LS || !chunk) return;
+    lua_pcall_t pcall = (lua_pcall_t)g_tramp_pcall;
+    int saved = p_gettop ? p_gettop(LS) : 0;
+    int st = p_loadbuffer(LS, chunk, (size_t)lstrlenA(chunk), "=coop");
+    if(st != 0){
+        const char* e = p_tolstring ? p_tolstring(LS, -1, 0) : 0;
+        L("[lua] compile err %d: %s", st, e ? e : "?");
+        if(p_settop) p_settop(LS, saved);
+        return;
+    }
+    st = pcall(LS, 0, -1, 0);   // -1 = LUA_MULTRET
+    if(st != 0){
+        const char* e = p_tolstring ? p_tolstring(LS, -1, 0) : 0;
+        L("[lua] run err %d: %s", st, e ? e : "?");
+    } else if(p_gettop && p_tolstring && p_gettop(LS) > saved){
+        const char* r = p_tolstring(LS, -1, 0);
+        if(r) lstrcpynA(g_lua_ret, r, sizeof(g_lua_ret));
+        L("[lua] chunk OK -> %s", r ? r : "(no-string)");
+    } else {
+        L("[lua] chunk OK (%d bytes)", lstrlenA(chunk));
+    }
+    if(p_settop) p_settop(LS, saved);
+}
+
+// Construye el chunk de setup: tabla de skus (decimal) + funciones de validez.
+// COOP_NEXT(i,d): siguiente indice VALIDO desde i en direccion d (con wrap), 0 si ninguno.
+// COOP_FIX(i): i si valido, si no el siguiente valido (para corregir el inicial).
+static void build_setup_chunk(void){
+    char* p = g_sys_chunk;
+    p += sprintf(p, "COOP_SKUS={");
+    for(int i=0;i<g_ncyc;i++) p += sprintf(p, "%s%u", i?",":"", (unsigned)g_sku[i]);
+    p += sprintf(p,
+        "} function COOP_NEXT(i,d) local n=#COOP_SKUS for k=1,n do i=i+d "
+        "if i<1 then i=n elseif i>n then i=1 end "
+        "if Player_IsCharacterValid(COOP_SKUS[i]) then return i end end return 0 end "
+        "function COOP_FIX(i) if Player_IsCharacterValid(COOP_SKUS[i]) then return i else return COOP_NEXT(i,1) end end");
+}
+
+// Aplica el personaje del indice idx (0-based) a P2 (re-materializa).
+static void apply_cycle_index(int idx){
+    if(idx < 0 || idx >= g_ncyc || !g_item[idx]) return;
+    g_cyc_idx       = idx;
+    g_p2_sku        = g_sku[idx];
+    g_p2_item       = g_item[idx];
+    g_cycle_pending = 1;        // on_e01890 re-materializa a P2
+    L("[cycle] P2 -> %s (0x%x)", g_name[idx], g_sku[idx]);
+}
+
+// Handler del hook de pcall (hilo de la VM, top-level). Sin I/O en passthrough.
+void on_pcall(void* LS){
+    if(!g_L) g_L = LS;
+    if(LS != g_L || g_in_tick) return;
+    // 1) setup (una vez): define COOP_* y valida/corrige el personaje inicial de P2
+    if(!g_setup_done){
+        g_in_tick = 1;
+        build_setup_chunk();
+        run_lua_chunk(LS, g_sys_chunk);
+        sprintf(g_sys_chunk, "return COOP_FIX(%d)", g_cyc_idx + 1);
+        run_lua_chunk(LS, g_sys_chunk);
+        int ni = (int)strtoul(g_lua_ret, 0, 10);
+        if(ni >= 1 && ni <= g_ncyc && (ni-1) != g_cyc_idx) apply_cycle_index(ni-1);
+        g_setup_done = 1;
+        g_in_tick = 0;
+        return;
+    }
+    // 2) peticion de ciclo (RB/LB): siguiente VALIDO en la direccion y aplicar
+    if(g_cycle_req){
+        g_in_tick = 1;
+        sprintf(g_sys_chunk, "return COOP_NEXT(%d,%d)", g_cyc_idx + 1, g_cycle_dir);
+        run_lua_chunk(LS, g_sys_chunk);
+        int ni = (int)strtoul(g_lua_ret, 0, 10);
+        if(ni >= 1 && ni <= g_ncyc) apply_cycle_index(ni-1);
+        else L("[cycle] sin personaje valido en este mundo");
+        g_cycle_req = 0;
+        g_in_tick = 0;
+        return;
+    }
+    // 3) trigger de prueba L3+R3 (chunk de fichero)
+    if(g_lua_pending){
+        g_in_tick = 1; g_lua_pending = 0;
+        run_lua_chunk(LS, g_lua_chunk);
+        g_in_tick = 0;
+    }
+}
+// Stub naked (patron probado). L = [esp+4] original -> tras pushal+pushfl en [esp+40].
+__attribute__((naked)) void stub_pcall(void){
+    __asm__(
+        "pushal\n\t"
+        "pushfl\n\t"
+        "movl 40(%esp), %eax\n\t"
+        "pushl %eax\n\t"
+        "call _on_pcall\n\t"
+        "addl $4, %esp\n\t"
+        "popfl\n\t"
+        "popal\n\t"
+        "jmp *_g_tramp_pcall\n\t"
+    );
+}
+
+// Resuelve la API de Lua en directo (loadbuffer/tolstring/gettop/settop). Sin hooks.
+static int g_lua_bridge_done = 0;
+static void install_lua_bridge(void* base){
+    if(g_lua_bridge_done) return;
+    p_loadbuffer = (luaL_loadbuffer_t)((BYTE*)base + RVA_LUAL_LOADBUFFER);
+    p_tolstring  = (lua_tolstring_t)  ((BYTE*)base + RVA_LUA_TOLSTRING);
+    p_gettop     = (lua_gettop_t)     ((BYTE*)base + RVA_LUA_GETTOP);
+    p_settop     = (lua_settop_t)     ((BYTE*)base + RVA_LUA_SETTOP);
+    g_lua_bridge_done = 1;
+    L("[lua] API resuelta: loadbuffer=%p", p_loadbuffer);
+}
+
+// Instala el hook de pcall PEREZOSAMENTE (tras materializar, al 1er trigger).
+static void ensure_pcall_hook(void){
+    if(g_pcall_hooked) return;
+    void* base = game_base();
+    install_hook((BYTE*)base + RVA_LUA_PCALL, (void*)stub_pcall, 7, &g_tramp_pcall);
+    g_pcall_hooked = 1;
+    L("[lua] pcall hookeado (tramp=%p)", g_tramp_pcall);
+}
+
+// Lee coop_lua.txt a g_lua_chunk y lo encola. Instala el hook de pcall si falta.
+static void queue_lua_from_file(void){
+    ensure_pcall_hook();
+    char path[MAX_PATH]; lstrcpynA(path, g_log, MAX_PATH);
+    char* p = strrchr(path, '\\'); if(p) strcpy(p+1, "coop_lua.txt"); else strcpy(path, "coop_lua.txt");
+    FILE* f = fopen(path, "rb");
+    if(!f){ L("[lua] trigger: no abro coop_lua.txt"); return; }
+    size_t n = fread(g_lua_chunk, 1, sizeof(g_lua_chunk)-1, f); g_lua_chunk[n] = 0; fclose(f);
+    L("[lua] trigger L3+R3: %u bytes encolados", (unsigned)n);
+    if(n > 0) g_lua_pending = 1;   // el hook de pcall capta g_L y lo ejecuta
+}
+// ======================================================================
 
 // ---- materializacion (corre dentro de e01890, mgr=ecx) ----
 static int g_frames = 0, g_newHandle = 0, g_joinMsg = 0;
@@ -233,7 +414,9 @@ void on_e01890(void* mgr){
 void on_solidify(void* esp){
     DWORD slot = *(DWORD*)((BYTE*)esp + 4);
     void* av   = *(void**)((BYTE*)esp + 8);
-    if(slot == 1 && av){ BYTE f = *((BYTE*)av + 0x39); if(f & 2) *((BYTE*)av + 0x39) = f & 0xFD; }
+    // limpiar el bit "fantasma" para P2 (slot 1) y tambien P1 (slot 0): al
+    // re-materializar P2 en un cambio de personaje, a P1 se le quedaba el bit.
+    if((slot == 0 || slot == 1) && av){ BYTE f = *((BYTE*)av + 0x39); if(f & 2) *((BYTE*)av + 0x39) = f & 0xFD; }
 }
 
 __attribute__((naked)) void stub_e01890(void){
@@ -264,8 +447,8 @@ __attribute__((naked)) void stub_solidify(void){
 
 static void install_hooks(void* base){
     if(g_hooks_done) return;
-    g_tramp_e01890  = install_hook((BYTE*)base + 0xA01890, (void*)stub_e01890, 6);
-    g_tramp_solidify= install_hook((BYTE*)base + 0x9E9DC0, (void*)stub_solidify, 7);
+    install_hook((BYTE*)base + 0xA01890, (void*)stub_e01890, 6, &g_tramp_e01890);
+    install_hook((BYTE*)base + 0x9E9DC0, (void*)stub_solidify, 7, &g_tramp_solidify);
     g_hooks_done = 1;
     L("[coop] hooks instalados: e01890=%p solidify=%p", g_tramp_e01890, g_tramp_solidify);
 }
@@ -319,12 +502,12 @@ static void run_coop(void){
     g_coop_done = 1;
     g_active = 1;                         // e01890 empieza a materializar a P2
     L("[coop] drop-in llamado + materializacion ON. P2 solido en ~1s.");
-    // resolver TODOS los personajes del cambiador (una pasada) + el inicial
-    prescan_items();
-    // colocar el indice del cambiador en el personaje inicial (si esta en la lista)
-    for(int i=0;i<NCHARS;i++) if(g_chars[i].sku==g_p2_sku){ g_cyc_idx=i; break; }
-    g_p2_item = (g_cyc_idx>=0 && g_items_cache[g_cyc_idx]) ? g_items_cache[g_cyc_idx]
-                                                          : resolve_item_ptr(g_p2_sku);
+    // descubrir TODOS los personajes cargados (una pasada) + resolver el inicial
+    scan_characters();
+    g_cyc_idx = 0;
+    for(int i=0;i<g_ncyc;i++) if(g_sku[i]==g_p2_sku){ g_cyc_idx=i; break; }
+    g_p2_item = (g_cyc_idx>=0 && g_cyc_idx<g_ncyc && g_item[g_cyc_idx]) ? g_item[g_cyc_idx]
+                                                                       : resolve_item_ptr(g_p2_sku);
     g_pending_item = g_p2_item;    // aplicar el personaje inicial una vez
     L("[coop] item inicial de P2 (sku 0x%x) = %p", g_p2_sku, g_p2_item);
 }
@@ -350,12 +533,18 @@ static void coop_trigger(void){
 
 static DWORD WINAPI worker(LPVOID unused){
     (void)unused;
+    install_lua_bridge(game_base());   // resolver API de Lua (sin hooks)
     Sleep(1500);
     L("=== DI3 co-op mod cargado (proxy bink2w32) ===");
     load_xinput();
     BYTE prev[4] = {0,0,0,0};
-    BYTE prevCyc[4] = {0,0,0,0};
+    BYTE prevRB[4] = {0,0,0,0};
+    BYTE prevLB[4] = {0,0,0,0};
+    BYTE prevRun[4] = {0,0,0,0};
+    int active_ticks = 0;
     for(;;){
+        // tras materializar (~2s), instalar el hook de pcall: valida el personaje inicial
+        if(g_active){ if(active_ticks < 1000000) active_ticks++; if(active_ticks == 80) ensure_pcall_hook(); }
         if(pXI){
             for(DWORD pad=0; pad<4; pad++){
                 BYTE st[16];
@@ -367,21 +556,18 @@ static DWORD WINAPI worker(LPVOID unused){
                         if(pad == 1) coop_trigger();
                     }
                     prev[pad] = now;
-                    // CAMBIADOR de personaje de P2: LB+RB juntos en el mando 2 (pad 1)
-                    BYTE cyc = ((b & 0x0300) == 0x0300) ? 1 : 0;   // LEFT_SHOULDER|RIGHT_SHOULDER
-                    if(cyc && !prevCyc[pad] && pad == 1 && g_active && !g_cycle_pending){
-                        for(int k=0; k<NCHARS; k++){
-                            g_cyc_idx = (g_cyc_idx + 1) % NCHARS;
-                            if(g_items_cache[g_cyc_idx]){
-                                g_p2_sku  = g_chars[g_cyc_idx].sku;   // FASE1 usara este sku
-                                g_p2_item = g_items_cache[g_cyc_idx]; // para cargar su modelo
-                                g_cycle_pending = 1;                  // el hook re-materializa
-                                L("[input] cambiar P2 -> %s (0x%x)", g_chars[g_cyc_idx].name, g_chars[g_cyc_idx].sku);
-                                break;
-                            }
-                        }
+                    // CICLADOR P2 (pad 1): RB=siguiente, LB=anterior. Salta invalidos (via Lua).
+                    if(pad == 1 && g_active){
+                        BYTE rb = (b & 0x0200) ? 1 : 0;   // RIGHT_SHOULDER
+                        BYTE lb = (b & 0x0100) ? 1 : 0;   // LEFT_SHOULDER
+                        if(rb && !prevRB[pad] && !g_cycle_req && !g_cycle_pending){ ensure_pcall_hook(); g_cycle_dir =  1; g_cycle_req = 1; }
+                        if(lb && !prevLB[pad] && !g_cycle_req && !g_cycle_pending){ ensure_pcall_hook(); g_cycle_dir = -1; g_cycle_req = 1; }
+                        prevRB[pad] = rb; prevLB[pad] = lb;
                     }
-                    prevCyc[pad] = cyc;
+                    // PRUEBA (dev): L3+R3 (clic de ambos sticks) ejecuta coop_lua.txt
+                    BYTE run = ((b & 0x00C0) == 0x00C0) ? 1 : 0;   // LEFT_THUMB|RIGHT_THUMB
+                    if(run && !prevRun[pad] && pad == 1){ queue_lua_from_file(); }
+                    prevRun[pad] = run;
                 }
             }
         }

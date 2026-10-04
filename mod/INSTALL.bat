@@ -27,6 +27,6 @@ echo.
 echo [OK] Mod installed.
 echo Launch the game, enter a Toy Box or a Play Set with 2 controllers,
 echo press START on controller 2 to join Player 2.
-echo Press LB+RB together on controller 2 to change Player 2's character.
+echo RB = next character, LB = previous (controller 2); only valid ones per world.
 echo To uninstall: run UNINSTALL.bat
 pause

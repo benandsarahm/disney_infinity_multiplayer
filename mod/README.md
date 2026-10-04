@@ -1,78 +1,82 @@
-# Disney Infinity 3.0 (PC / Steam) — Local Split-Screen Co-op mod
+# Disney Infinity 3.0 (PC / Steam) — Local Split-Screen Co-op
 
-A single native proxy DLL that restores **local 2-player split-screen co-op** on the PC
-port of *Disney Infinity 3.0: Gold Edition* — working in the **Toy Box AND in Play Sets**
-(story worlds), with **live character selection for Player 2**.
+Unofficial interoperability mod. **v1.0**
 
-No Python, no Frida, no external runtime. Just one DLL. It only reads/writes the running
-process memory — it does **not** touch saves, online, or achievements, and it's fully
-reversible.
+Restores local multiplayer on the PC port: enter a Toy Box **or a Play Set**,
+press **START on controller 2**, and Player 2 drops in with **split-screen**,
+each player on their own gamepad.
 
-> Built by combining two reverse-engineering projects:
-> **CrabeLoader / DisneyInfinity-SplitScreenMods (LucasLhomme)** for the Player-2 *join*
-> groundwork, and this project for the **Player-2 spawn + body materialization +
-> character load + selector**. See CREDITS.
+Player 2 can also **choose their character** with the shoulder buttons, and the
+mod only lets them pick characters that are **valid for the current world** (in
+an Inside Out Play Set only the Inside Out cast shows up, etc.).
 
----
-
-## What it does
-- Press **START on controller 2** in a Toy Box or a Play Set → Player 2 joins:
-  split screen, its own camera, its own controller, solid body.
-- Press **LB + RB together on controller 2** → Player 2 **changes character** live
-  (cycles through the built-in list; the model is loaded properly).
-- Player 2's **starting** character is read from `coop_p2.txt` (a SKU; see
-  `CHARACTERS_SKU.txt`). Default is Anakin (`f4308`).
+It is a `bink2w32.dll` **proxy**: on launch it loads the mod, forwards all Bink
+video to the renamed original, and waits for Start on controller 2 to run the
+co-op sequence **in memory**. It does **not** modify the .exe, saves, online or
+achievements. Reversible.
 
 ## Requirements
-- Disney Infinity 3.0: Gold Edition (PC / Steam), legit copy.
-- Two XInput controllers (Xbox-style).
+- Disney Infinity 3.0: Gold Edition (PC / Steam), legitimate copy.
+- 2 Xbox-style controllers (XInput).
+- Be **inside a Toy Box or a Play Set** (a game loaded) when you press Start.
 
 ## Install (1 minute)
-1. Copy these files into the game folder (next to `DisneyInfinity3.exe`), typically
-   `...\Steam\steamapps\common\Disney Infinity 3.0 Gold Edition\`:
-   - `coop_bink2w32.dll`
-   - `coop_p2.txt`
-   - `INSTALL.bat`, `UNINSTALL.bat`
-2. With the game **closed**, run **`INSTALL.bat`** (it backs up the original
-   `bink2w32.dll` as `_bink2w32_orig.dll` and drops the proxy in).
-3. Launch the game normally.
-
-**Uninstall:** run `UNINSTALL.bat` (or Steam → Verify integrity of game files).
+1. Copy these files into the game folder (where `DisneyInfinity3.exe` is):
+   `coop_bink2w32.dll`, `INSTALL.bat`, `UNINSTALL.bat`, `coop_p2.txt` (optional).
+2. With the **game closed**, double-click `INSTALL.bat` (it backs up the original
+   as `_bink2w32_orig.dll` and installs the mod).
+3. Launch the game normally (via Steam).
 
 ## How to play
-1. Enter a Toy Box or a Play Set with 2 controllers connected.
-2. **START on controller 2** → Player 2 joins.
-3. **LB+RB on controller 2** → change Player 2's character.
-4. In a Play Set, only that franchise's characters are valid — cycle to a valid one
-   (e.g. in a Star Wars world use Ahsoka/Anakin/ObiWan/Yoda/DarthMaul).
+1. Enter a Toy Box or a Play Set.
+2. Connect controller 2.
+3. Press **START on controller 2** → Player 2 and the split-screen appear.
 
-## Notes / known
-- The character cycler rotates through ALL characters (not filtered per world yet).
-- Changing Player 2's character can briefly flash Player 1 as a "materializing" ghost;
-  it resolves by itself and Player 1 stays fully playable.
-- Built for the current Steam Gold Edition build.
+## Choosing Player 2's character (NEW)
+With **controller 2**, once Player 2 has joined:
+- **RB** (right shoulder) = **next** character
+- **LB** (left shoulder) = **previous** character
 
-## How it works (short)
-The proxy `bink2w32.dll` forwards all 77 Bink exports to the renamed original
-(`_bink2w32_orig.dll`) and starts a thread. On START (controller 2) it runs, in the game's
-own memory: resolve the players container → find the game loop → call the drop-in creator
-(the real join) → materialize Player 2's body → resolve the chosen character's item and
-call the game's character-apply to **load the model**. LB+RB re-materializes the body with
-the next character. Full addresses, offsets and the exact call chain are in
-**`RECIPE_FOR_CRABELOADER.md`**; the full source is in **`src/coop.c`**.
+The mod auto-discovers **every** character in the game and only cycles through
+the ones **valid for the current world** (it skips the rest).
 
-Build (with Zig, portable): `zig cc -target x86-windows-gnu -shared -O2 -o bink2w32.dll coop.c bink2w32.def -lkernel32`
+- **Auto-fix:** if you enter a Play Set with a character that isn't valid there,
+  the mod automatically switches Player 2 to a valid one ~2 seconds after joining.
+- **Starting character:** edit `coop_p2.txt` (next to the mod) with the SKU you
+  want for P2 (see `CHARACTERS_SKU.txt`). Default: `f4308` (Anakin). If it isn't
+  valid in the world, the auto-fix corrects it.
+
+## Known limitations (v1)
+- After P2 changes character, **Player 1 may appear as a translucent hologram.**
+  Fix: Player 2 presses **START** once and P1 refreshes.
+- **Re-joining P2 after leaving to another world** may not work in the same
+  session. Fix: restart the game to re-join Player 2.
+- In a Play Set, P2's character must belong to that franchise (the cycler handles
+  this). If a model shows up "white", cycle to another character with RB/LB.
+
+## Uninstall
+- With the game closed, double-click `UNINSTALL.bat` (restores the original
+  `bink2w32.dll`). Or: Steam → right-click the game → Properties → Installed
+  Files → Verify integrity.
+
+## How it works (brief)
+- Proxy `bink2w32.dll` (compiled with Zig). On Start (controller 2) it calls the
+  game's drop-in creator, then materializes P2's body with inline hooks.
+- Character validation uses the game's own Lua VM: the mod hooks `lua_pcall` to
+  run small Lua snippets (`Player_IsCharacterValid`) on the live game state, so
+  the cycler only offers characters valid for the current world.
+- Nothing is written to disk by the game on behalf of the mod; all changes are
+  in-process and reverted by uninstalling.
 
 ## Credits
-- **[LucasLhomme](https://github.com/LucasLhomme)** — CrabeLoader,
-  DisneyInfinity-SplitScreenMods, CrabeMenu. The Player-2 join method (drop-in / viewport /
-  split), `GameStandAloneLoop`, `LockPlayerToController`, and the `SetCharacter` /
-  `ForceUnlockData` character API this project cross-checked against.
-- This project — Player-2 spawn + body materialization, the sku→item resolution and the
-  native character-load call, and the proxy-DLL mod that ties it together with a
-  START trigger and an LB+RB character selector.
+Co-op achieved by combining two reverse-engineering projects:
+- **CrabeLoader / DisneyInfinity-SplitScreenMods** (LucasLhomme, "crabe_crabe" on
+  Discord): the Player 2 "join" method (controller + viewport + split) and the
+  map of the game's Lua API used to validate characters.
+  <https://github.com/LucasLhomme/DisneyInfinity-SplitScreenMods>
+- **This project:** Player 2 character materialization, the per-franchise
+  character cycler, and the DLL mod that joins both halves and triggers it with
+  Start on controller 2.
 
-## Legal / ethics
-Educational, non-commercial interoperability research on a legitimate copy, for local play.
-Ships no game code or assets and defeats no DRM. Disney Infinity and its marks belong to
-their owners. Use at your own risk.
+Educational, non-commercial interoperability project. Contains no game code or
+assets. Disney Infinity and its brands belong to their owners. Use at your own risk.
